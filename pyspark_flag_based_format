@@ -1,0 +1,86 @@
+# MAGIC %run ./config/setup_environment
+
+# COMMAND ----------
+
+# MAGIC %run ./global_functions.py
+
+# COMMAND ----------
+
+from pyspark.sql.functions import col, lit, when, date_format, to_timestamp, coalesce, trim, expr, first
+from pyspark.sql.types import StringType
+from functools import reduce
+
+def harmonize_dates_pyspark_flags(df, configs):
+    date_cols = [c for c in df.columns if c.upper().endswith("DTC")]
+    if not date_cols:
+        return df, []
+        
+    #  Unpivot to long format.
+    key_cols = [c for c in df.columns if c not in date_cols]
+    stack_expr = f"stack({len(date_cols)}, {', '.join([f'cast(lit(\"{c}\") as string), `{c}`' for c in date_cols])}) as (date_col_name, original_value)"
+    unpivoted_df = df.selectExpr(*key_cols, stack_expr)
+
+    #  Harmonize using a single nested expression.
+    harmonized_value_expr = lit(None).cast(StringType())
+    for config in reversed(configs):
+        input_pattern = config["pattern"]
+        flag = config["flag"]
+        
+        parsed_timestamp = to_timestamp(col("original_value"), input_pattern)
+        
+        # Determine target format based on the flag
+        target_format_expr = when(lit(flag) == 'Date_time', lit("yyyy-MM-dd'T'HH:mm:ss")) \
+                              .when(lit(flag) == 'Date', lit("yyyy-MM-dd")) \
+                              .when(lit(flag) == 'Year_Month', lit("yyyy-MM")) \
+                              .when(lit(flag) == 'Year', lit("yyyy")) \
+                              .otherwise(lit("yyyy-MM-dd")) # Default case
+
+        parsed_val = date_format(parsed_timestamp, target_format_expr)
+        harmonized_value_expr = when(parsed_timestamp.isNotNull(), parsed_val).otherwise(harmonized_value_expr)
+
+    # Apply the harmonization expression.
+    is_iso_expr = (to_timestamp(col("original_value"), ISO_DATE_FORMAT_FOR_DATE_ISO8601).isNotNull()) | (coalesce(trim(col("original_value")), lit("")) == "")
+    harmonized_long_df = unpivoted_df.withColumn("harmonized_value", when(is_iso_expr, col("original_value")).otherwise(harmonized_value_expr))
+    
+    # Pivot and reassemble logic is identical to the explicit format version.
+    pivoted_df = harmonized_long_df.groupBy(*key_cols).pivot("date_col_name", date_cols).agg(first("harmonized_value").alias("harmonized_value"), first("original_value").alias("original_value"))
+    
+    final_cols_expr = key_cols.copy()
+    new_cols = []
+    for col_name in date_cols:
+        final_cols_expr.append(col(f"`{col_name}`.harmonized_value").alias(col_name))
+        original_col_name = f"{col_name}_ORIGINAL_VALUE"
+        final_cols_expr.append(col(f"`{col_name}`.original_value").alias(original_col_name))
+        new_cols.append(original_col_name)
+    final_df = pivoted_df.select(final_cols_expr)
+    return final_df, new_cols
+
+# --- Main Execution Block ---
+input_schema, output_schema = get_input_and_output_schemas()
+domains_to_process = get_pipeline_tables_to_process()
+
+# Load harmonization patterns from config file.
+iso_config_df = archive_config_file(filename=FILE_DATE_ISO_8601_HARMONISATION_CONFIG, worksheet="sheet1")
+iso_configs = iso_config_df.select("pattern", "flag").toPandas().to_dict('records')
+
+all_conflicts = {}
+for domain in domains_to_process:
+    print(f"Harmonizing {domain} domain.")
+    source_df = read_pipeline_input_dataset(domain)
+    date_columns = [c for c in source_df.columns if c.upper().endswith("DTC")]
+    if not date_columns:
+        write_pipeline_output_view(domain)
+        continue
+
+    harmonized_df, new_columns = harmonize_dates_pyspark_flags(source_df, iso_configs)
+    
+    for col_name in date_columns:
+        all_conflicts = generate_conflicts(harmonized_df, domain, col_name, all_conflicts)
+    
+    select_cols = list(set(list(source_df.columns) + new_columns))
+    final_df_to_write = harmonized_df.select(*select_cols)
+    write_pipeline_output_table(domain, final_df_to_write)
+
+if all_conflicts:
+    output_conflict_file = get_notebook_config_file_with_path(filename=FILE_DATE_ISO_8601_HARMONISATION_CONFLICTS)
+    create_excel_from_dataframes(f"{output_conflict_file}", all_conflicts)
