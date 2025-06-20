@@ -1,0 +1,39 @@
+package com.yourorg.utils
+
+import java.time.format.{DateTimeFormatter, DateTimeParseException, ResolverStyle, DateTimeFormatterBuilder}
+import java.time.temporal.{TemporalAccessor, ChronoField}
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.broadcast.Broadcast
+
+object UDFLogic {
+  // Parses date string using an explicit target pattern.
+  def parseDate(originalDateStr: String, patternConfigs: Seq[(String, String)]): String = {
+    if (originalDateStr == null || originalDateStr.trim.isEmpty) return null
+    for ((inputPattern, targetPattern) <- patternConfigs) {
+      try {
+        val parser = new DateTimeFormatterBuilder().appendPattern(inputPattern).parseDefaulting(ChronoField.MONTH_OF_YEAR, 1).parseDefaulting(ChronoField.DAY_OF_MONTH, 1).toFormatter().withResolverStyle(ResolverStyle.STRICT)
+        val temporal = parser.parse(originalDateStr)
+        // Directly format using the provided target pattern.
+        return DateTimeFormatter.ofPattern(targetPattern).format(temporal)
+      } catch { case _: DateTimeParseException => }
+    }
+    null
+  }
+}
+
+object DateHarmonizerRegistration {
+  private def convertSparkPatternToJava(p: String): String = {
+    if (p == null) return null
+    // A simplified conversion, can be extended.
+    p.replace("yyyy", "uuuu").replace("yy", "uu").replaceAll("S+", "SSS")
+  }
+  // Registers the UDF that uses explicit target formats.
+  def registerUDF(spark: SparkSession, viewName: String, udfName: String): Unit = {
+    // Read patterns from the temp view created by PySpark.
+    val patterns = spark.table(viewName).select("spark_input_pattern_col", "spark_target_iso_pattern_col").collect().map(r => (convertSparkPatternToJava(r.getString(0)), r.getString(1))).toSeq
+    val broadcastedPatterns = spark.sparkContext.broadcast(patterns)
+    val udfLambda = (dateStr: String) => UDFLogic.parseDate(dateStr, broadcastedPatterns.value)
+    spark.udf.register(udfName, udfLambda)
+    println(s"INFO: UDF '$udfName' registered with ${patterns.length} patterns.")
+  }
+}
