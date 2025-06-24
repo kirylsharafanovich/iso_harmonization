@@ -1,7 +1,11 @@
-# Pandas UDF Harmonization (Explicit Target Format)
-# Branch: feature/pandas-udf-explicit-format
-# This script integrates with the existing global_functions framework.
-#
+# Databricks notebook source
+# MAGIC %run ./config/setup_environment
+
+# COMMAND ----------
+
+# MAGIC %run ./global_functions.py
+
+# COMMAND ----------
 
 from pyspark.sql.functions import col, lit, when, pandas_udf, PandasUDFType, expr, first, coalesce, trim, to_timestamp
 from pyspark.sql.types import StringType
@@ -20,7 +24,6 @@ def create_pandas_udf_explicit(configs):
         # Helper to convert Spark patterns to Python's strftime format.
         def convert_pattern(p):
             if p is None: return None
-            # This is a simplified conversion, add more replacements if needed.
             return p.replace('yyyy', '%Y').replace('MM', '%m').replace('dd', '%d') \
                     .replace('HH', '%H').replace('mm', '%M').replace('ss', '%S') \
                     .replace('SSS', '%f').replace("'T'", "T")
@@ -52,12 +55,17 @@ def harmonize_dates_pandas_udf(df, udf):
     date_cols = [c for c in df.columns if c.upper().endswith("DTC")]
     if not date_cols: return df, []
     
-    #  Unpivot to long format.
+    # 1. Unpivot to long format.
     key_cols = [c for c in df.columns if c not in date_cols]
-    stack_expr = f"stack({len(date_cols)}, {', '.join([f'cast(lit(\"{c}\") as string), `{c}`' for c in date_cols])}) as (date_col_name, original_value)"
+    
+    stack_args = []
+    for c in date_cols:
+        stack_args.append(f"'{c}', `{c}`")
+    
+    stack_expr = f"stack({len(date_cols)}, {', '.join(stack_args)}) as (date_col_name, original_value)"
     unpivoted_df = df.selectExpr(*key_cols, stack_expr)
     
-    #  Harmonize using the provided Pandas UDF.
+    # 2. Harmonize using the provided Pandas UDF.
     is_iso_expr = (to_timestamp(col("original_value"), ISO_DATE_FORMAT_FOR_DATE_ISO8601).isNotNull()) | (coalesce(trim(col("original_value")), lit("")) == "")
     
     harmonized_long_df = unpivoted_df.withColumn(
@@ -65,7 +73,7 @@ def harmonize_dates_pandas_udf(df, udf):
         when(is_iso_expr, col("original_value")).otherwise(udf(col("original_value")))
     )
     
-    #  Pivot and reassemble.
+    # 3. Pivot and reassemble.
     pivoted_df = harmonized_long_df.groupBy(*key_cols).pivot("date_col_name", date_cols).agg(first("harmonized_value").alias("harmonized_value"), first("original_value").alias("original_value"))
     
     final_cols_expr = key_cols.copy()
@@ -78,14 +86,9 @@ def harmonize_dates_pandas_udf(df, udf):
     return pivoted_df.select(final_cols_expr), new_cols
 
 # --- Main Execution Block ---
-# Assumes setup_environment and global_functions have been run.
-
-spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
-
 input_schema, output_schema = get_input_and_output_schemas()
 domains_to_process = get_pipeline_tables_to_process()
 
-# This version expects 'input_pattern' and 'target_iso_pattern' columns.
 iso_config_df = archive_config_file(filename=FILE_DATE_ISO_8601_HARMONISATION_CONFIG, worksheet="sheet1")
 iso_configs = iso_config_df.select("input_pattern", "target_iso_pattern").toPandas().to_dict('records')
 
