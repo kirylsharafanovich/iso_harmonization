@@ -18,34 +18,24 @@ def create_pandas_udf_explicit(configs):
     broadcasted_patterns = spark.sparkContext.broadcast(configs)
     
     def _harmonize_series(s: pd.Series) -> pd.Series:
-        # This inner function is applied to each pandas Series (batch of data).
         patterns = broadcasted_patterns.value
-        
-        # Helper to convert Spark patterns to Python's strftime format.
-        def convert_pattern(p):
+        def convert_pattern(p): # Converts Spark pattern to Python's strftime
             if p is None: return None
-            return p.replace('yyyy', '%Y').replace('MM', '%m').replace('dd', '%d') \
-                    .replace('HH', '%H').replace('mm', '%M').replace('ss', '%S') \
-                    .replace('SSS', '%f').replace("'T'", "T")
+            return p.replace('yyyy', '%Y').replace('MM', '%m').replace('dd', '%d').replace('HH', '%H').replace('mm', '%M').replace('ss', '%S').replace('SSS', '%f').replace("'T'", "T")
             
         def _parse(date_str):
-            # This function processes a single date string.
             if not isinstance(date_str, str) or not date_str.strip(): return None
             for config in patterns:
                 try:
                     py_input = convert_pattern(config['input_pattern'])
                     dt_obj = datetime.strptime(date_str, py_input)
                     py_target = convert_pattern(config['target_iso_pattern'])
-                    
-                    # strftime with %f produces 6 digits, manually trim to 3 for milliseconds.
                     formatted = dt_obj.strftime(py_target)
                     if ".%f" in py_target and "." in formatted:
                         parts = formatted.split('.'); formatted = f"{parts[0]}.{parts[1][:3]}"
                     return formatted
-                except (ValueError, TypeError):
-                    continue
+                except (ValueError, TypeError): continue
             return None
-            
         return s.apply(_parse)
         
     return pandas_udf(_harmonize_series, StringType())
@@ -55,34 +45,20 @@ def harmonize_dates_pandas_udf(df, udf):
     date_cols = [c for c in df.columns if c.upper().endswith("DTC")]
     if not date_cols: return df, []
     
-    # 1. Unpivot to long format.
     key_cols = [c for c in df.columns if c not in date_cols]
-    
-    stack_args = []
-    for c in date_cols:
-        stack_args.append(f"'{c}', `{c}`")
-    
+    stack_args = [f"'{c}', `{c}`" for c in date_cols]
     stack_expr = f"stack({len(date_cols)}, {', '.join(stack_args)}) as (date_col_name, original_value)"
     unpivoted_df = df.selectExpr(*key_cols, stack_expr)
     
-    # 2. Harmonize using the provided Pandas UDF.
     is_iso_expr = (to_timestamp(col("original_value"), ISO_DATE_FORMAT_FOR_DATE_ISO8601).isNotNull()) | (coalesce(trim(col("original_value")), lit("")) == "")
     
-    harmonized_long_df = unpivoted_df.withColumn(
-        "harmonized_value",
-        when(is_iso_expr, col("original_value")).otherwise(udf(col("original_value")))
-    )
+    harmonized_long_df = unpivoted_df.withColumn("harmonized_value", when(is_iso_expr, col("original_value")).otherwise(udf(col("original_value"))))
     
-    # 3. Pivot and reassemble.
     pivoted_df = harmonized_long_df.groupBy(*key_cols).pivot("date_col_name", date_cols).agg(first("harmonized_value").alias("harmonized_value"), first("original_value").alias("original_value"))
-    
-    final_cols_expr = key_cols.copy()
-    new_cols = []
+    final_cols_expr = key_cols.copy(); new_cols = []
     for col_name in date_cols:
         final_cols_expr.append(col(f"`{col_name}`.harmonized_value").alias(col_name))
-        original_col_name = f"{col_name}_ORIGINAL_VALUE"
-        final_cols_expr.append(col(f"`{col_name}`.original_value").alias(original_col_name))
-        new_cols.append(original_col_name)
+        original_col_name = f"{col_name}_ORIGINAL_VALUE"; final_cols_expr.append(col(f"`{col_name}`.original_value").alias(original_col_name)); new_cols.append(original_col_name)
     return pivoted_df.select(final_cols_expr), new_cols
 
 # --- Main Execution Block ---
@@ -92,12 +68,10 @@ domains_to_process = get_pipeline_tables_to_process()
 iso_config_df = archive_config_file(filename=FILE_DATE_ISO_8601_HARMONISATION_CONFIG, worksheet="sheet1")
 iso_configs = iso_config_df.select("input_pattern", "target_iso_pattern").toPandas().to_dict('records')
 
-# Create the Pandas UDF once with the loaded patterns.
 harmonization_udf = create_pandas_udf_explicit(iso_configs)
 
 all_conflicts = {}
 for domain in domains_to_process:
-    print(f"Harmonizing {domain} domain.")
     source_df = read_pipeline_input_dataset(domain)
     date_columns = [c for c in source_df.columns if c.upper().endswith("DTC")]
     if not date_columns:
