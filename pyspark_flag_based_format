@@ -12,18 +12,14 @@ from pyspark.sql.types import StringType
 from functools import reduce
 
 def harmonize_dates_pyspark_flags(df, configs):
+    # This function harmonizes date columns using a vectorized unpivot/pivot approach.
     date_cols = [c for c in df.columns if c.upper().endswith("DTC")]
     if not date_cols:
         return df, []
         
     # 1. Unpivot to long format.
     key_cols = [c for c in df.columns if c not in date_cols]
-    
-    # FIXED: Re-written to be syntactically correct and more readable.
-    stack_args = []
-    for c in date_cols:
-        stack_args.append(f"'{c}', `{c}`")
-    
+    stack_args = [f"'{c}', `{c}`" for c in date_cols]
     stack_expr = f"stack({len(date_cols)}, {', '.join(stack_args)}) as (date_col_name, original_value)"
     unpivoted_df = df.selectExpr(*key_cols, stack_expr)
 
@@ -67,13 +63,11 @@ input_schema, output_schema = get_input_and_output_schemas()
 domains_to_process = get_pipeline_tables_to_process()
 
 # Load harmonization patterns from config file.
-# This version expects 'pattern' and 'flag' columns.
 iso_config_df = archive_config_file(filename=FILE_DATE_ISO_8601_HARMONISATION_CONFIG, worksheet="sheet1")
 iso_configs = iso_config_df.select("pattern", "flag").toPandas().to_dict('records')
 
 all_conflicts = {}
 for domain in domains_to_process:
-    print(f"Harmonizing {domain} domain.")
     source_df = read_pipeline_input_dataset(domain)
     date_columns = [c for c in source_df.columns if c.upper().endswith("DTC")]
     if not date_columns:
