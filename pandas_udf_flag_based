@@ -60,21 +60,39 @@ def create_pandas_udf_flags(configs):
     return pandas_udf(_harmonize_series, StringType())
 
 def harmonize_dates_pandas_udf(df, udf):
-    # This function is identical to the one in the explicit format version.
+    # This function uses the unpivot/pivot technique with a Pandas UDF.
     date_cols = [c for c in df.columns if c.upper().endswith("DTC")]
     if not date_cols: return df, []
     
+    # 1. Unpivot to long format.
     key_cols = [c for c in df.columns if c not in date_cols]
-    stack_expr = f"stack({len(date_cols)}, {', '.join([f'cast(lit(\"{c}\") as string), `{c}`' for c in date_cols])}) as (date_col_name, original_value)"
-    unpivoted_df = df.selectExpr(*key_cols, stack_expr)
-    is_iso_expr = (to_timestamp(col("original_value"), ISO_DATE_FORMAT_FOR_DATE_ISO8601).isNotNull()) | (coalesce(trim(col("original_value")), lit("")) == "")
-    harmonized_long_df = unpivoted_df.withColumn("harmonized_value", when(is_iso_expr, col("original_value")).otherwise(udf(col("original_value"))))
     
+    # Correctly build the stack expression.
+    stack_args = []
+    for c in date_cols:
+        stack_args.append(f"'{c}', `{c}`")
+    
+    stack_expr = f"stack({len(date_cols)}, {', '.join(stack_args)}) as (date_col_name, original_value)"
+    unpivoted_df = df.selectExpr(*key_cols, stack_expr)
+    
+    # 2. Harmonize using the provided Pandas UDF.
+    is_iso_expr = (to_timestamp(col("original_value"), ISO_DATE_FORMAT_FOR_DATE_ISO8601).isNotNull()) | (coalesce(trim(col("original_value")), lit("")) == "")
+    
+    harmonized_long_df = unpivoted_df.withColumn(
+        "harmonized_value",
+        when(is_iso_expr, col("original_value")).otherwise(udf(col("original_value")))
+    )
+    
+    # 3. Pivot and reassemble.
     pivoted_df = harmonized_long_df.groupBy(*key_cols).pivot("date_col_name", date_cols).agg(first("harmonized_value").alias("harmonized_value"), first("original_value").alias("original_value"))
-    final_cols_expr = key_cols.copy(); new_cols = []
+    
+    final_cols_expr = key_cols.copy()
+    new_cols = []
     for col_name in date_cols:
         final_cols_expr.append(col(f"`{col_name}`.harmonized_value").alias(col_name))
-        original_col_name = f"{col_name}_ORIGINAL_VALUE"; final_cols_expr.append(col(f"`{col_name}`.original_value").alias(original_col_name)); new_cols.append(original_col_name)
+        original_col_name = f"{col_name}_ORIGINAL_VALUE"
+        final_cols_expr.append(col(f"`{col_name}`.original_value").alias(original_col_name))
+        new_cols.append(original_col_name)
     return pivoted_df.select(final_cols_expr), new_cols
 
 # --- Main Execution Block ---
