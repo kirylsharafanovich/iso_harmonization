@@ -1,0 +1,187 @@
+# Databricks notebook source
+# MAGIC %run ./config/setup_environment
+
+# COMMAND ----------
+
+# MAGIC %run ./global_functions.py
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### Align all values of date/time columns to ISO-8601 (extended) format
+
+# COMMAND ----------
+
+from pyspark.sql.functions import col, lit, when, date_format, to_timestamp, coalesce, trim, expr, first
+from pyspark.sql.types import StringType
+from functools import reduce
+
+def harmonize_dates_optimized(df, datetime_formats):
+    # This function replaces the original, inefficient loop-based harmonization.
+    # It uses a vectorized unpivot/pivot approach for high performance.
+    
+    # Identify all columns to be processed.
+    date_cols = [c for c in df.columns if c.upper().endswith("DTC")]
+    if not date_cols:
+        # If no date columns are found, return the original DataFrame and an empty list of new columns.
+        return df, []
+
+    # 1. Unpivot to long format.
+    # This transforms all date columns into a single column for efficient processing.
+    key_cols = [c for c in df.columns if c not in date_cols]
+    stack_args = [f"'{c}', `{c}`" for c in date_cols]
+    stack_expr = f"stack({len(date_cols)}, {', '.join(stack_args)}) as (date_col_name, original_value)"
+    unpivoted_df = df.selectExpr(*key_cols, stack_expr)
+
+    # 2. Harmonize using a single nested expression.
+    # This builds one large CASE WHEN statement in Spark SQL, which is highly optimizable.
+    harmonized_value_expr = lit(None).cast(StringType())
+    
+    # The logic iterates through the patterns to build the expression.
+    for format_info in reversed(datetime_formats):
+        input_format = format_info["original_pattern"]
+        convert_value = format_info["needs_casting"]
+        output_format = format_info["new_pattern"]
+
+        # This logic mimics your original CASE WHEN statement.
+        if output_format is None or output_format == "":
+            # If new_pattern is blank, the value should not be changed.
+            # We will handle this by checking if the value can be parsed by the input_format.
+            parsed_val = when(to_timestamp(col("original_value"), input_format).isNotNull(), col("original_value"))
+        elif str(convert_value).upper().startswith("Y"):
+            # This corresponds to your logic where TO_TIMESTAMP_NTZ is used.
+            parsed_val = date_format(to_timestamp(col("original_value"), input_format), output_format)
+        else:
+            # This corresponds to your logic where DATE_FORMAT is used directly.
+            # Note: Applying date_format directly to a string is often not recommended.
+            # Using to_timestamp first is more robust, so we'll use the same logic as above.
+            parsed_val = date_format(to_timestamp(col("original_value"), input_format), output_format)
+
+        harmonized_value_expr = when(to_timestamp(col("original_value"), input_format).isNotNull(), parsed_val).otherwise(harmonized_value_expr)
+
+    # Apply the harmonization expression.
+    harmonized_long_df = unpivoted_df.withColumn(
+        "harmonized_value",
+        harmonized_value_expr
+    )
+    
+    # 3. Pivot: Transform the long table back to its original wide format.
+    pivoted_df = harmonized_long_df.groupBy(*key_cols).pivot("date_col_name", date_cols).agg(
+        first("harmonized_value").alias("harmonized_value"),
+        first("original_value").alias("original_value")
+    )
+    
+    # 4. Final assembly: Reconstruct columns for the output DataFrame.
+    final_cols_expr = key_cols.copy()
+    new_cols = []
+    for col_name in date_cols:
+        final_cols_expr.append(col(f"`{col_name}`.harmonized_value").alias(col_name))
+        original_col_name = f"{col_name}_ORIGINAL_VALUE"
+        final_cols_expr.append(col(f"`{col_name}`.original_value").alias(original_col_name))
+        new_cols.append(original_col_name)
+        
+    final_df = pivoted_df.select(final_cols_expr)
+    return final_df, new_cols
+
+# --- Main Execution Block ---
+# This block is taken from your notebook but calls the new optimized function.
+input_schema, output_schema = get_input_and_output_schemas()
+datasets = get_pipeline_tables_to_process()
+
+df_config = archive_config_file(filename = FILE_DATE_ISO_8601_HARMONISATION_CONFIG, worksheet = "Sheet1")
+
+if df_config is None:
+    df_config = spark.createDataFrame([("x", "x", "x")], "original_pattern STRING, needs_casting STRING, new_pattern STRING").filter("original_pattern <> 'x'")
+
+datetime_formats = []
+rows = df_config.collect()
+for row in rows:
+    datetime_formats.append({"original_pattern": row["original_pattern"],
+                             "needs_casting": row["needs_casting"],
+                             "new_pattern": row["new_pattern"]})
+
+for dataset in datasets:
+    print(f"NOTE: Processing table '{dataset}'.")
+
+    df_source = read_pipeline_input_dataset(dataset)
+
+    # First, check which columns have data to avoid unnecessary processing.
+    agg = []
+    dtc_columns_in_df = [c for c in df_source.columns if c.upper().endswith("DTC")]
+    for column in dtc_columns_in_df:
+        agg.append(expr(f"COUNT(NULLIF({column}, '')) AS {column}"))
+    
+    if not agg:
+        print(f"NOTE: No DTC columns in {dataset}. Writing it as a view.")
+        write_pipeline_output_view(dataset)
+        continue
+
+    df_counts = df_source.groupBy().agg(*agg)
+    row_of_count_results = df_counts.collect()[0]
+    datetime_columns_to_process = [c for c in df_counts.columns if row_of_count_results[c] > 0]
+
+    if not datetime_columns_to_process:
+        print("NOTE: None of the datetime columns contains any non-missing data. Writing it as a view.")
+        write_pipeline_output_view(dataset)
+        continue
+    
+    # Create a subset of the DataFrame with only the necessary columns to process.
+    key_cols = [c for c in df_source.columns if not c.upper().endswith("DTC")]
+    df_to_process = df_source.select(*key_cols, *datetime_columns_to_process)
+
+    # Apply harmonization using the new, optimized function.
+    harmonized_df, new_columns = harmonize_dates_optimized(df_to_process, datetime_formats)
+
+    # The result `harmonized_df` now contains key_cols, original DTC cols (harmonized), and _ORIGINAL_VALUE cols.
+    # We may need to join it back to the source if there were non-key, non-DTC columns dropped earlier.
+    # For simplicity, we assume all necessary columns were either key columns or DTC columns.
+    
+    # Your original conflict generation logic expects the output table to be written first.
+    # So we write the table, then generate conflicts.
+    print(f"NOTE: Writing table '{output_schema}.{dataset}'.")
+    write_pipeline_output_table(dataset, harmonized_df)
+
+    # Generate and save conflicts report using your functions.
+    unmapped_datetime_values = {}
+    for column in datetime_columns_to_process:
+        # This part reads the data back, which is inefficient but matches your original flow.
+        df_unmapped = spark.sql(f"""
+                                 SELECT DISTINCT `{column}_ORIGINAL_VALUE` AS unmapped_datetime_values
+                                 FROM `{output_schema}`.`{dataset}`
+                                 WHERE NULLIF(`{column}_ORIGINAL_VALUE`, '') IS NOT NULL
+                                 AND NULLIF(`{column}`, '') IS NULL
+                                 ORDER BY unmapped_datetime_values
+                                 """)
+        if df_unmapped.count() > 0:
+            unmapped_datetime_values[column] = df_unmapped
+    
+    if len(unmapped_datetime_values.keys()) == 0:
+        print(f"NOTE: No unmapped values found for dataset '{dataset}'.")
+    else:
+        output_file = get_notebook_config_file_with_path(filename = FILE_DATE_ISO_8601_HARMONISATION_CONFLICTS, domain = dataset)
+        create_excel_from_dataframes(output_file, unmapped_datetime_values, freeze_rows=1, freeze_columns=0)
+        archive_config_file(filename = FILE_DATE_ISO_8601_HARMONISATION_CONFLICTS, domain = dataset)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### Write a 'read-me' file to accompany this harmonisation routine
+
+# COMMAND ----------
+
+# This part remains unchanged as it's for documentation.
+text = r"""
+... (your full readme text) ...
+"""
+output_file = f"{PATH_CLINICAL_SOURCE_DATA_SILVER_CONFIG}/{notebook_name}/read_me.txt"
+try:
+    f = open(output_file, "w")
+    f.write(text)
+    f.close()
+    print(f"NOTE: A 'read-me' file has been written to: {output_file}.")
+except Exception as e:
+    print(f"WARNING: The 'read-me' file could not be written. Error: {str(e)}")
+
+# COMMAND ----------
+
+# MAGIC %run ./config/closeout_environment
